@@ -93,14 +93,14 @@ def list_tables(namespace: str = "") -> str:
                    If empty, lists tables across all namespaces.
 
     Returns a JSON array of objects with database, schema, table name,
-    column names, and column types.
+    and column count.
     """
     try:
         if namespace:
             namespace = validate_namespace(namespace)
             rows = execute_query(
                 f"SELECT database_name, schema_name, table_name, "
-                f"       column_names, column_types "
+                f"       column_count, estimated_size "
                 f"FROM duckdb_tables() "
                 f"WHERE database_name = '{CATALOG}' "
                 f"  AND schema_name = '{namespace}' "
@@ -109,7 +109,7 @@ def list_tables(namespace: str = "") -> str:
         else:
             rows = execute_query(
                 f"SELECT database_name, schema_name, table_name, "
-                f"       column_names, column_types "
+                f"       column_count, estimated_size "
                 f"FROM duckdb_tables() "
                 f"WHERE database_name = '{CATALOG}' "
                 f"ORDER BY schema_name, table_name"
@@ -989,46 +989,54 @@ def search_tables(
     Returns matching tables with their column lists.
     """
     try:
-        rows = execute_query(
-            f"SELECT database_name, schema_name, table_name, "
-            f"       column_names, column_types "
+        # Get tables
+        tables = execute_query(
+            f"SELECT database_name, schema_name, table_name, column_count "
             f"FROM duckdb_tables() "
             f"WHERE database_name = '{CATALOG}'"
         )
 
+        # Use DESCRIBE per table for real column info
+        # (information_schema.columns returns placeholder data for Iceberg tables)
+        geom_indicators = {"geometry", "geom", "wkb_geometry", "shape", "the_geom"}
         results = []
-        for row in rows:
-            table_name = row.get("table_name", "")
-            col_names = row.get("column_names", [])
-            col_types = row.get("column_types", [])
+        for row in tables:
+            tname = row.get("table_name", "")
+            sname = row.get("schema_name", "")
 
             # Apply table name filter
-            if pattern and pattern.lower() not in table_name.lower():
+            if pattern and pattern.lower() not in tname.lower():
                 continue
+
+            # Get real column info via DESCRIBE
+            try:
+                desc = execute_query(f"DESCRIBE {CATALOG}.{sname}.{tname}")
+                col_names = [d["column_name"] for d in desc]
+                col_types = [d["column_type"] for d in desc]
+                row["column_count"] = len(desc)
+            except Exception:
+                col_names = []
+                col_types = []
 
             # Apply column name filter
             if column_pattern:
-                col_match = any(
-                    column_pattern.lower() in c.lower()
-                    for c in (col_names if isinstance(col_names, list) else [])
-                )
-                if not col_match:
+                if not any(column_pattern.lower() in c.lower() for c in col_names):
                     continue
 
             # Detect geometry columns
-            geom_indicators = {"geometry", "geom", "wkb_geometry", "shape", "the_geom"}
             has_geometry = False
-            if isinstance(col_names, list) and isinstance(col_types, list):
-                for cname, ctype in zip(col_names, col_types):
-                    if (cname.lower() in geom_indicators
-                            or "GEOMETRY" in str(ctype).upper()
-                            or "BLOB" in str(ctype).upper()):
-                        has_geometry = True
-                        break
+            for cname, ctype in zip(col_names, col_types):
+                if (cname.lower() in geom_indicators
+                        or "GEOMETRY" in str(ctype).upper()
+                        or "BLOB" in str(ctype).upper()):
+                    has_geometry = True
+                    break
 
             if geometry_only and not has_geometry:
                 continue
 
+            row["column_names"] = col_names
+            row["column_types"] = col_types
             row["has_geometry"] = has_geometry
             results.append(row)
 
