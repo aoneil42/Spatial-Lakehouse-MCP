@@ -19,9 +19,10 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from .config import settings
-from .engine import get_connection, execute_query, check_health
+from .engine import get_connection, execute_query, check_health, _lock
 from .validators import (
     validate_read_only_sql,
+    validate_where_clause,
     validate_identifier,
     validate_namespace,
     validate_table_ref,
@@ -282,6 +283,7 @@ def spatial_filter(
         # Build full query
         where_clause = predicate
         if where:
+            where = validate_where_clause(where)
             where_clause = f"{predicate} AND ({where})"
 
         sql = (
@@ -338,6 +340,7 @@ def nearest_features(
         where_clause = ""
         conditions = []
         if where:
+            where = validate_where_clause(where)
             conditions.append(f"({where})")
         if max_distance_meters > 0:
             conditions.append(f"{distance_expr} <= {float(max_distance_meters)}")
@@ -379,7 +382,11 @@ def get_bbox(
         qualified = validate_table_ref(table, CATALOG)
         geom_col = validate_identifier(geometry_column, "geometry_column")
 
-        where_clause = f"WHERE {where}" if where else ""
+        if where:
+            where = validate_where_clause(where)
+            where_clause = f"WHERE {where}"
+        else:
+            where_clause = ""
 
         sql = (
             f"SELECT "
@@ -489,7 +496,11 @@ def spatial_join(
         select_parts.append(f"ST_AsGeoJSON(l.{l_geom}) AS geojson")
         select_clause = ", ".join(select_parts)
 
-        where_clause = f"AND ({where})" if where else ""
+        if where:
+            where = validate_where_clause(where)
+            where_clause = f"AND ({where})"
+        else:
+            where_clause = ""
 
         sql = (
             f"SELECT {select_clause} "
@@ -576,8 +587,16 @@ def aggregate_within(
         group_parts.append(f"poly.{pg_geom}")
 
         # Build WHERE clauses
-        point_filter = f"AND ({where_points})" if where_points else ""
-        polygon_filter = f"WHERE {where_polygons}" if where_polygons else ""
+        if where_points:
+            where_points = validate_where_clause(where_points)
+            point_filter = f"AND ({where_points})"
+        else:
+            point_filter = ""
+        if where_polygons:
+            where_polygons = validate_where_clause(where_polygons)
+            polygon_filter = f"WHERE {where_polygons}"
+        else:
+            polygon_filter = ""
 
         sql = (
             f"SELECT {', '.join(select_parts)} "
@@ -630,7 +649,11 @@ def buffer_analysis(
         dist = validate_positive_number(distance_meters, "distance_meters")
         limit = max(1, min(limit, settings.max_result_rows))
 
-        where_clause = f"WHERE {where}" if where else ""
+        if where:
+            where = validate_where_clause(where)
+            where_clause = f"WHERE {where}"
+        else:
+            where_clause = ""
 
         buffer_expr = (
             f"ST_Transform("
@@ -895,7 +918,11 @@ def export_geojson(
                 and "BLOB" not in str(r.get("column_type", "")).upper()
             ]
 
-        where_clause = f"WHERE {where}" if where else ""
+        if where:
+            where = validate_where_clause(where)
+            where_clause = f"WHERE {where}"
+        else:
+            where_clause = ""
         prop_select = ", ".join(prop_cols)
 
         sql = (
@@ -1046,6 +1073,63 @@ def search_tables(
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MATERIALIZATION (Tier 3 Bridge)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+@mcp.tool()
+def materialize_result(
+    sql: str,
+    result_name: str,
+    namespace: str = "_scratch",
+    overwrite: bool = True,
+) -> str:
+    """Write a query result to a scratch table for visualization.
+
+    Materializes the result of a SELECT query as an Iceberg table
+    in the scratch namespace, making it available to the webmap
+    via the feature API.
+
+    Args:
+        sql: A read-only SELECT query producing the result to materialize.
+        result_name: Name for the result table (e.g., "buffer_500m").
+        namespace: Target namespace (default "_scratch").
+        overwrite: If true, replaces an existing table with the same name.
+
+    Returns confirmation with table reference and row count.
+    """
+    try:
+        validate_read_only_sql(sql)
+        result_name = validate_identifier(result_name, "result_name")
+        namespace = validate_identifier(namespace, "namespace")
+        qualified = f"{CATALOG}.{namespace}.{result_name}"
+
+        conn = get_connection()
+        with _lock:
+            conn.execute(
+                f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{namespace}"
+            )
+
+            if overwrite:
+                conn.execute(f"DROP TABLE IF EXISTS {qualified}")
+
+            conn.execute(f"CREATE TABLE {qualified} AS {sql}")
+
+            count = conn.execute(
+                f"SELECT COUNT(*)::INTEGER FROM {qualified}"
+            ).fetchone()[0]
+
+        return json.dumps({
+            "status": "materialized",
+            "table": f"{namespace}.{result_name}",
+            "qualified": qualified,
+            "row_count": count,
+        }, indent=2)
+    except Exception as e:
+        return format_error(e, "materialize_result")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SYSTEM TOOLS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1067,4 +1151,4 @@ def health_check() -> str:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    mcp.run(transport="streamable-http")
+    mcp.run(transport=settings.transport)

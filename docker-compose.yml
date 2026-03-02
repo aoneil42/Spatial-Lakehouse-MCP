@@ -1,0 +1,39 @@
+# Docker Compose for Spatial Lakehouse MCP (Tier 2)
+#
+# Intended to replace the mcp-server block in the main lakehouse stack's
+# docker-compose.yml. To use standalone, ensure lakekeeper and garage
+# services are available on the 'lakehouse' network.
+
+services:
+  # ─── Spatial Lakehouse MCP (Tier 2) ────────────────────────────
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-server
+    ports:
+      - "8082:8082"
+    environment:
+      GARAGE_KEY_ID: "${GARAGE_KEY_ID}"
+      GARAGE_SECRET_KEY: "${GARAGE_SECRET_KEY}"
+      SLM_CATALOG_URI: "http://lakekeeper:8181"
+      SLM_CATALOG_WAREHOUSE: "lakehouse"
+      SLM_S3_ENDPOINT: "garage:3900"
+      SLM_ACCESS_DELEGATION_MODE: "none"
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    networks:
+      - lakehouse
+    mem_limit: 2g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; r = httpx.get('http://localhost:8082/health'); r.raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+networks:
+  lakehouse:
+    external: true

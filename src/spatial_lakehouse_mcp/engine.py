@@ -1,8 +1,8 @@
 """DuckDB engine: single connection handling catalog attachment + spatial queries."""
 
 import logging
+import threading
 import duckdb
-from contextlib import contextmanager
 from typing import Optional
 
 from .config import settings
@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 # Module-level connection — lazily initialized
 _conn: Optional[duckdb.DuckDBPyConnection] = None
+_lock = threading.Lock()
 
 
 def _build_s3_secret_sql() -> str:
@@ -70,64 +71,78 @@ def _build_iceberg_secret_sql() -> str:
 def _build_attach_sql() -> str:
     """Build ATTACH statement for LakeKeeper Iceberg catalog.
 
-    Uses ACCESS_DELEGATION_MODE 'none' to bypass LakeKeeper's remote signing,
-    which returns S3 URLs with Docker-internal hostnames. Instead, DuckDB uses
-    the locally-defined S3 secret with host-accessible endpoints.
+    ACCESS_DELEGATION_MODE is configurable:
+      - 'none': host-side (bypasses LakeKeeper signing, uses local S3 secret)
+      - 'vended-credentials': Docker (uses LakeKeeper's S3 credentials)
     """
-    return f"""
-    ATTACH '{settings.catalog_warehouse}' AS {settings.catalog_alias} (
-        TYPE iceberg,
-        ENDPOINT '{settings.catalog_uri}/catalog',
-        SECRET iceberg_catalog_secret,
-        ACCESS_DELEGATION_MODE 'none'
-    );
-    """
+    attach_parts = [
+        f"ATTACH '{settings.catalog_warehouse}' AS {settings.catalog_alias} (",
+        f"    TYPE iceberg,",
+        f"    ENDPOINT '{settings.catalog_uri}/catalog',",
+        f"    SECRET iceberg_catalog_secret",
+    ]
+    if settings.access_delegation_mode:
+        attach_parts.append(
+            f"    , ACCESS_DELEGATION_MODE '{settings.access_delegation_mode}'"
+        )
+    attach_parts.append(");")
+    return "\n".join(attach_parts)
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:
     """Get or create the DuckDB connection with catalog attached.
 
-    Uses lazy initialization — first call installs extensions, creates
-    secrets, and attaches the catalog. Subsequent calls return the
-    existing connection.
+    Uses lazy initialization with double-checked locking — first call
+    installs extensions, creates secrets, and attaches the catalog.
+    Subsequent calls return the existing connection.
     """
     global _conn
     if _conn is not None:
         return _conn
 
-    logger.info("Initializing DuckDB connection...")
-    conn = duckdb.connect(database=":memory:")
+    with _lock:
+        # Double-check after acquiring lock
+        if _conn is not None:
+            return _conn
 
-    # Install and load extensions
-    for ext in ("iceberg", "httpfs", "spatial"):
-        conn.execute(f"INSTALL {ext};")
-        conn.execute(f"LOAD {ext};")
-        logger.info(f"Loaded extension: {ext}")
+        logger.info("Initializing DuckDB connection...")
+        conn = duckdb.connect(database=":memory:")
 
-    # Create S3 secret for Garage
-    if settings.s3_access_key_id:
-        conn.execute(_build_s3_secret_sql())
-        logger.info(f"Created S3 secret for endpoint {settings.s3_endpoint}")
+        # Install and load extensions
+        for ext in ("iceberg", "httpfs", "spatial"):
+            conn.execute(f"INSTALL {ext};")
+            conn.execute(f"LOAD {ext};")
+            logger.info(f"Loaded extension: {ext}")
 
-    # Create Iceberg secret for LakeKeeper
-    conn.execute(_build_iceberg_secret_sql())
-    logger.info("Created Iceberg catalog secret")
+        # Create S3 secret for Garage
+        if settings.s3_access_key_id:
+            conn.execute(_build_s3_secret_sql())
+            logger.info(f"Created S3 secret for endpoint {settings.s3_endpoint}")
 
-    # Attach the catalog
-    try:
-        conn.execute(_build_attach_sql())
-        logger.info(
-            f"Attached catalog '{settings.catalog_warehouse}' "
-            f"as '{settings.catalog_alias}' from {settings.catalog_uri}"
+        # Create Iceberg secret for LakeKeeper
+        conn.execute(_build_iceberg_secret_sql())
+        logger.info("Created Iceberg catalog secret")
+
+        # Attach the catalog
+        try:
+            conn.execute(_build_attach_sql())
+            logger.info(
+                f"Attached catalog '{settings.catalog_warehouse}' "
+                f"as '{settings.catalog_alias}' from {settings.catalog_uri}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to attach catalog: {e}")
+            # Store connection even if attach fails — health_check will report status
+            _conn = conn
+            raise
+
+        # Enforce query timeout
+        conn.execute(
+            f"SET statement_timeout = '{settings.query_timeout_seconds}s'"
         )
-    except Exception as e:
-        logger.error(f"Failed to attach catalog: {e}")
-        # Store connection even if attach fails — health_check will report status
-        _conn = conn
-        raise
 
-    _conn = conn
-    return _conn
+        _conn = conn
+        return _conn
 
 
 def execute_query(sql: str, params: list | None = None) -> list[dict]:
@@ -136,27 +151,29 @@ def execute_query(sql: str, params: list | None = None) -> list[dict]:
     Handles DuckDB result conversion including geometry columns.
     """
     conn = get_connection()
-    try:
-        if params:
-            result = conn.execute(sql, params)
-        else:
-            result = conn.execute(sql)
+    with _lock:
+        try:
+            if params:
+                result = conn.execute(sql, params)
+            else:
+                result = conn.execute(sql)
 
-        if result.description is None:
-            return []
+            if result.description is None:
+                return []
 
-        columns = [desc[0] for desc in result.description]
-        rows = result.fetchmany(settings.max_result_rows)
-        return [dict(zip(columns, row)) for row in rows]
-    except Exception as e:
-        logger.error(f"Query execution failed: {e}\nSQL: {sql}")
-        raise
+            columns = [desc[0] for desc in result.description]
+            rows = result.fetchmany(settings.max_result_rows)
+            return [dict(zip(columns, row)) for row in rows]
+        except Exception as e:
+            logger.error(f"Query execution failed: {e}\nSQL: {sql}")
+            raise
 
 
 def execute_scalar(sql: str) -> any:
     """Execute a query and return a single scalar value."""
     conn = get_connection()
-    return conn.execute(sql).fetchone()[0]
+    with _lock:
+        return conn.execute(sql).fetchone()[0]
 
 
 def check_health() -> dict:
@@ -192,6 +209,12 @@ def check_health() -> dict:
         status["error"] = str(e)
 
     return status
+
+
+def set_connection(conn: duckdb.DuckDBPyConnection):
+    """Inject a connection (for testing)."""
+    global _conn
+    _conn = conn
 
 
 def reset_connection():

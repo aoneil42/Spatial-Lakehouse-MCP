@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     # If you already have a bearer token instead of OAuth2 credentials:
     catalog_token: str = Field(default="", description="Bearer token (alternative to OAuth2)")
 
+    # Iceberg access delegation
+    access_delegation_mode: str = Field(
+        default="none",
+        description="'none' for host-side (bypasses LakeKeeper signing), "
+                    "'vended-credentials' for Docker (uses LakeKeeper's S3 credentials)"
+    )
+
     # Garage S3 connection
     s3_endpoint: str = Field(
         default="localhost:3900",
@@ -44,7 +51,10 @@ class Settings(BaseSettings):
     s3_url_style: str = Field(default="path", description="S3 URL style: path or vhost")
 
     # Query limits
-    max_result_rows: int = Field(default=100, ge=1, le=5000)
+    max_result_rows: int = Field(default=5000, ge=1, le=50000,
+        description="Hard ceiling on rows returned by any tool")
+    default_result_rows: int = Field(default=100, ge=1, le=5000,
+        description="Default LIMIT when tool caller doesn't specify")
     max_query_length: int = Field(default=8000, ge=100, le=50000)
     query_timeout_seconds: int = Field(default=30, ge=1, le=300)
 
@@ -52,6 +62,8 @@ class Settings(BaseSettings):
     server_name: str = Field(default="spatial-lakehouse-mcp")
     server_host: str = Field(default="0.0.0.0")
     server_port: int = Field(default=8082)
+    transport: str = Field(default="streamable-http",
+        description="MCP transport: 'streamable-http' for Docker/remote, 'stdio' for Claude Desktop")
 
 
 settings = Settings()

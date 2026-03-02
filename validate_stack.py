@@ -14,18 +14,24 @@ Usage:
   python validate_stack.py
 """
 
+import os
 import sys
 import traceback
 
 import duckdb
 
 # ── Configuration (matches running stack at ../lakehouse/.env) ─────
-GARAGE_KEY_ID = "GK8e7e0e5439eda8588e0a2693"
-GARAGE_SECRET = "3dfca5c6f09403e7b954f94a91f59a61c1c3c9230ac5d50e8bba58c81c3a1533"
-GARAGE_ENDPOINT = "localhost:3900"
-LAKEKEEPER_ENDPOINT = "http://localhost:8181/catalog"
-LAKEKEEPER_TOKEN = "dummy"
-S3_BUCKET = "lakehouse"
+GARAGE_KEY_ID = os.environ.get("GARAGE_KEY_ID", "GK8e7e0e5439eda8588e0a2693")
+GARAGE_SECRET = os.environ.get(
+    "GARAGE_SECRET_KEY",
+    "3dfca5c6f09403e7b954f94a91f59a61c1c3c9230ac5d50e8bba58c81c3a1533",
+)
+GARAGE_ENDPOINT = os.environ.get("SLM_S3_ENDPOINT", "localhost:3900")
+LAKEKEEPER_ENDPOINT = os.environ.get(
+    "SLM_CATALOG_URI", "http://localhost:8181"
+) + "/catalog"
+LAKEKEEPER_TOKEN = os.environ.get("SLM_CATALOG_TOKEN", "dummy")
+S3_BUCKET = os.environ.get("SLM_CATALOG_WAREHOUSE", "lakehouse")
 
 pass_count = 0
 fail_count = 0

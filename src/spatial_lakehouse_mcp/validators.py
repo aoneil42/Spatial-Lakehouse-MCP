@@ -16,23 +16,6 @@ DANGEROUS_FIRST_KEYWORDS = {
     "ATTACH", "DETACH", "INSTALL", "LOAD", "PRAGMA", "SET",
 }
 
-# Allowed spatial functions in queries
-ALLOWED_SPATIAL_FUNCTIONS = {
-    "ST_Area", "ST_AsGeoJSON", "ST_AsText", "ST_Buffer", "ST_Centroid",
-    "ST_Contains", "ST_Crosses", "ST_DWithin", "ST_Difference",
-    "ST_Distance", "ST_Envelope", "ST_Equals", "ST_Extent",
-    "ST_GeomFromGeoJSON", "ST_GeomFromText", "ST_Intersection",
-    "ST_Intersects", "ST_Length", "ST_MakePoint", "ST_Overlaps",
-    "ST_SetSRID", "ST_SimplifyPreserveTopology", "ST_Touches",
-    "ST_Transform", "ST_Union", "ST_Within", "ST_X", "ST_Y",
-    "ST_GeomFromWKB", "ST_AsWKB", "ST_Collect", "ST_ConvexHull",
-    "ST_ExteriorRing", "ST_FlipCoordinates", "ST_GeometryType",
-    "ST_IsEmpty", "ST_IsValid", "ST_NPoints", "ST_Perimeter",
-    "ST_Point", "ST_ReducePrecision", "ST_RemoveRepeatedPoints",
-    "ST_SRID",
-}
-
-
 def validate_read_only_sql(sql: str) -> None:
     """Validate that a SQL string is a read-only SELECT query.
 
@@ -65,6 +48,37 @@ def validate_read_only_sql(sql: str) -> None:
     # Reject multi-statement queries (semicolons in the middle)
     if ";" in stripped:
         raise ValueError("Multi-statement queries are not allowed.")
+
+
+# ── WHERE Clause Safety ────────────────────────────────────────────
+
+# Patterns that should never appear in a WHERE clause
+_WHERE_BANNED = re.compile(
+    r'\b(UNION|INTO|COPY|ATTACH|DETACH|INSTALL|LOAD|PRAGMA|SET)\b',
+    re.IGNORECASE,
+)
+
+
+def validate_where_clause(where: str) -> str:
+    """Validate a user-supplied WHERE clause fragment.
+
+    Rejects multi-statement injection and dangerous keywords.
+    Returns the validated clause or raises ValueError.
+    """
+    if not where or not where.strip():
+        return ""
+    where = where.strip()
+
+    if ";" in where:
+        raise ValueError("WHERE clause cannot contain semicolons.")
+
+    if _WHERE_BANNED.search(where):
+        raise ValueError(
+            "WHERE clause contains a disallowed keyword. "
+            "Only filtering expressions are permitted."
+        )
+
+    return where
 
 
 # ── Identifier Safety ──────────────────────────────────────────────
